@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, NamedTuple
 
+from .address import AbstractDaliAddress, DaliGearGroupAddress
 from .dali_alliance_db import DaliAllianceProductDB, DaliAllianceProductRecord
 from .types import DaliCommandCode, DaliException, SpecialCommandCode
 
@@ -61,15 +62,18 @@ class GearType(Enum):
     RELAY = 7
     COLOUR = 8
 
+    GEAR_GROUP = 128  # This isn't a DALI GearType.  Its a magic value we put in for Groups. 
+
 
 @dataclass
 class DaliGear:
     # The main fields that must be set at construction time.
     transciever: Any  # To avoid circular dependency
-    address: int
+    address: AbstractDaliAddress
 
     # Device state
     level: int = 0
+    groups: int = 0
 
     # Device info that we read from memory bank 0 - These won't be populated until fetch_deviceinfo is called
     device_type: GearType|None = None
@@ -84,6 +88,11 @@ class DaliGear:
     device_num_logical_control_gears: int = 0
     device_control_index: int = 0
 
+
+    def __init__(self, transciever: Any, address: AbstractDaliAddress) -> None:
+        self.transciever = transciever
+        self.address = address
+
     @property
     def unique_id(self):
         """
@@ -95,8 +104,8 @@ class DaliGear:
         return "{}-{}-{}".format(self.gtin, self.serial, self.device_control_index)
 
 
-    async def _send_cmd(self, cmd):
-        return await self.transciever.send_cmd(self.address, cmd)
+    async def _send_cmd(self, cmd, repeat=1):
+        return await self.transciever.send_cmd(self.address, cmd, repeat)
 
     async def read_memory(self, bank, offset, num):
         await self.transciever.send_special_cmd(SpecialCommandCode.SetDTR1, bank)  # Set memory bank
@@ -110,6 +119,9 @@ class DaliGear:
             buf.append(b)
         return bytes(buf)
 
+    @property
+    def present(self): 
+        return self.device_type is not None
     
     async def fetch_deviceinfo(self):
         dt = await self.transciever.send_cmd(self.address, DaliCommandCode.QueryDeviceType)
@@ -160,20 +172,8 @@ class DaliGear:
         return self.level
 
 
-    def matches_address(self, addr):
-        """supplied with a dali address (bit shifted and with group marker), check to see if it addresses this entity"""
-        if addr == 0xFF:
-            return True
-        if addr & 0x80:
-            # Address is a group address.
-            group_bm = 1 << (addr >> 1 & 0x0F)
-            return self.groups & group_bm != 0
-        else:
-            return self.address == addr >> 1
-
-
     async def brightness(self, level):
-        await self.transciever.send_direct_arc_power(self.address << 1, level)
+        await self.transciever.send_direct_arc_power(self.address, level)
         # self.level = level
 
     async def on(self):
@@ -208,14 +208,57 @@ class DaliGear:
 
     async def set_power_on_level(self, level):
         await self.transciever.send_special_cmd(DaliCommandCode.SetDTR0, level)
-        # Command must be sent twice within 100ms.
-        await self._send_cmd(DaliCommandCode.SetPowerOnLevel)
-        await self._send_cmd(DaliCommandCode.SetPowerOnLevel)
+        await self._send_cmd(DaliCommandCode.SetPowerOnLevel, 2)
 
 
     async def toggle(self):
-        level = await self.get_level()
+        level = await self.update_level()
         if level == 0:
             await self.on()
         else:
             await self.off()
+
+
+
+class DaliGearGroup(DaliGear):
+    def __init__(self, transciever, address: DaliGearGroupAddress, group_members) -> None:
+        super().__init__(transciever, address)
+        if not isinstance(address, DaliGearGroupAddress):
+            raise Exception("Invalid Address Argument")
+        self.group_members = group_members
+
+    @property
+    def unique_id(self):
+        """
+        Unique IDs for a DaliGearGroup are a bit different
+        """
+        return "{}-{}".format(self.transciever.unique_id, self.address)
+
+    @property
+    def mask(self):
+        return 1 << self.address.group_num
+
+    @property
+    def has_gear(self):
+        return len(self.group_members) > 0
+
+
+    async def fetch_deviceinfo(self):
+        """We can't query a device group's device info, because it might be different in each case.  Instead. """
+        self.device_type = GearType.GEAR_GROUP
+        self.groups = 0
+        if self.has_gear > 0:
+            self.max_level = self.group_members[0].max_level
+            self.min_level = self.group_members[0].min_level
+        else:
+            self.max_level = 254
+            self.min_level = 1
+
+    async def update_level(self): 
+        """Instead of querying all of the gear, we query the first member of this group (assuming there is one)"""
+        if self.has_gear == 0:
+            self.level = 0
+        else:            
+            self.level = await self.group_members[0].update_level()
+        return self.level
+        

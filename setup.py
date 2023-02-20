@@ -8,7 +8,7 @@ long_description = (this_directory / "README.md").read_text()
 
 setuptools.setup(
     name="async_dali",
-    version="0.1.3",
+    version="0.1.6",
     author="Bruce Cooper",
     description="A module to discover devices and send commands to DALI enabled lights",
     long_description=long_description,

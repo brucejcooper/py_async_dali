@@ -1,10 +1,15 @@
 import asyncio
-from typing import Awaitable, List
+import logging
+from typing import Any, Awaitable, List, NamedTuple
 
-from .gear import DaliGear
+from .address import AbstractDaliAddress, DaliGearAddress, DaliGearGroupAddress
+from .gear import DaliGear, DaliGearGroup
 from .types import (DaliCommandCode, DaliException, FramingException,
                     MessageSource, SearchAddressClashException,
-                    SpecialCommandCode)
+                    SpecialCommandCode, ItemDelta)
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SearchAddressSender:
@@ -32,20 +37,56 @@ class SearchAddressSender:
             self.lastH = h
 
 
-
 class DaliBusTransciever:
+    devices: List[DaliGear]
+    groups: List[DaliGearGroup]
+    transcievers: List['DaliBusTransciever'] = []
+    manufacturer: str|None
+    model: str|None
+    serial: str|None
     
     def __init__(self) -> None:
         self._new_message_callbacks = []
+        self.devices = [DaliGear(self, DaliGearAddress(index)) for index in range(0,64)]
+        self.groups = [DaliGearGroup(self, DaliGearGroupAddress(index), []) for index in range(0,16)]
+        self.manufacturer = None
+        self.model = None
+        self.serial = None
+
+    @property
+    def unique_id(self):
+        raise Exception("Not Implemented")
+
+    @property
+    def present_gear(self):
+        return [g for g in self.devices if g.present]
+
+    @property
+    def present_groups(self):
+        return [g for g in self.groups if g.has_gear]
+
+
+    @classmethod
+    async def scan_for_transcievers(cls) -> ItemDelta['DaliBusTransciever']:
+        subclz = cls.__subclasses__()
+
+        res = ItemDelta([], [])
+        for sc in subclz:
+            delta = await sc._transciever_scan()
+            res.extend(delta)
+            cls.transcievers.extend(delta.added)
+            for to_remove in delta.removed:
+                cls.transcievers.remove(to_remove)
+        return res
 
     def _send(self, data: int, length: int = 16, repeat: int = 1)-> Awaitable[int|None]:
         raise Exception("Not Implemented")
 
-    def send_direct_arc_power(self, address: int, level) -> Awaitable[None]:
-        return self._send((address << 8) | level)
+    def send_direct_arc_power(self, address: AbstractDaliAddress, level) -> Awaitable[None]:
+        return self._send((address.code << 8) | level)
 
-    def send_cmd(self, address: int, cmd: DaliCommandCode, repeat=1) -> Awaitable[int|None]:
-        return self._send((address << 9 ) | 0x0100 | cmd.value, repeat=repeat)
+    def send_cmd(self, address: AbstractDaliAddress, cmd: DaliCommandCode, repeat=1) -> Awaitable[int|None]:
+        return self._send((address.code << 8) | 0x0100 | cmd.value, repeat=repeat)
 
     def send_special_cmd(self, special_cmd: SpecialCommandCode, param: int = 0, repeat=1) -> Awaitable[None]:
         return self._send((special_cmd.value << 8) | param, repeat=repeat)
@@ -74,14 +115,17 @@ class DaliBusTransciever:
         pass # By default, do nothing
 
     async def scan_for_gear(self):
-        self.devices = []
-        for address in range(0,64):
-            gear = DaliGear(self, address)
+        for gear in self.devices:
+            _LOGGER.debug("Scanning %s", gear)
             await gear.fetch_deviceinfo()
 
-            if gear.device_type:
-                self.devices.append(gear)
+        for group in self.groups:
+            bit_mask = 1 << group.address.group_num
+            group.group_members =  [g for g in self.devices if g.groups & bit_mask != 0]
+            await group.fetch_deviceinfo()
+
         return self.devices
+
 
     async def compare(self, search, address_sender):
         """
@@ -136,9 +180,6 @@ class DaliBusTransciever:
             else:
                 # 1 or more devices below or equal to mid, but we don't know which
                 high = mid
-
-        
-
 
 
     async def commission(self):
@@ -203,13 +244,6 @@ class DaliBusTransciever:
             await self.send_special_cmd(DaliCommandCode.Terminate, 0)
                 
 
-def is_address_group(addr: int):
-    return addr & 0x80 != 0
-
-
-def filter_for_address(entities, address):
-    return [e for e in entities if e.matches_address(address)]
-
 
 class DaliMessage: 
     """Represents a message being transmitted or received by the driver"""
@@ -231,6 +265,16 @@ class DaliMessage:
         which (already discovered) gear would be affected"""
         return []
 
+    def get_affected_groups(self, affected_gear):
+        """Once we've worked out which devices are affected by a message, we need to work out
+        which groups also incidentally get affected."""
+
+        mask = 0
+        for g in affected_gear:
+            mask = mask | g.groups
+
+        return [g for g in self.transciever.groups if mask & g.mask != 0]
+
 class ResponseMessage(DaliMessage):
     pass
 
@@ -239,32 +283,27 @@ class NakMessage(ResponseMessage):
         return super().__repr__() + " NAK"
 
 class AddressedMessage(DaliMessage):
-    address: int
+    address: AbstractDaliAddress
 
-    def __init__(self, transciever: DaliBusTransciever, source: MessageSource, sequence_number: int, address: int):
+    def __init__(self, transciever: DaliBusTransciever, source: MessageSource, sequence_number: int, address: AbstractDaliAddress):
         super().__init__(transciever, source, sequence_number)
         self.address = address
 
     @property
     def affected_gear(self):
-        return [g for g in self.transciever.devices if g.matches_address(self.address)]
+        return [g for g in self.transciever.devices if self.address.matches_gear(g)]
 
 
 
 class DirectArcPowerCommand(AddressedMessage):
     value: int
 
-    def __init__(self, transciever: DaliBusTransciever, source: MessageSource, sequence_number: int, address: int, value: int):
+    def __init__(self, transciever: DaliBusTransciever, source: MessageSource, sequence_number: int, address: AbstractDaliAddress, value: int):
         super().__init__(transciever, source, sequence_number, address)
         self.value = value
 
     def __repr__(self):
-        if is_address_group(self.address):
-            return super().__repr__() + " DAPC(G{}, {})".format(self.address >> 1, self.value)
-        else:
-            return super().__repr__() + " DAPC(A{}, {})".format(self.address >> 1, self.value)
-
-
+        return super().__repr__() + " DAPC({}, {})".format(self.address, self.value)
 
 
 class NumericResponseMessage(ResponseMessage):
@@ -279,15 +318,12 @@ class NumericResponseMessage(ResponseMessage):
 class AddressedCommand(AddressedMessage):
     command: DaliCommandCode    
 
-    def __init__(self, transciever: DaliBusTransciever, source: MessageSource, sequence_number: int, address: int, command: DaliCommandCode):
+    def __init__(self, transciever: DaliBusTransciever, source: MessageSource, sequence_number: int, address: AbstractDaliAddress, command: DaliCommandCode):
         super().__init__(transciever, source, sequence_number, address)
         self.command = command
 
     def __repr__(self):
-        if is_address_group(0x80):
-            return super().__repr__() + " > {}(A{})".format(self.command.name, self.address >> 1)
-        else:
-            return super().__repr__() + " > {}(G{})".format(self.command.name, self.address >> 1)
+        return super().__repr__() + " > {}({})".format(self.command.name, self.address)
 
     @property
     def affected_gear(self):
@@ -310,26 +346,10 @@ class SpecialCommand(DaliMessage):
         return super().__repr__() + " special > {}(0x{:02x})".format(self.command.name, self.operand)
 
 
-class BroadcastCommand(DaliMessage):
-    unaddressed: bool = False
-    command: DaliCommandCode
-
-    def __init__(self, transciever: DaliBusTransciever, source: MessageSource, sequence_number: int, unaddressed: bool, command: DaliCommandCode):
-        super().__init__(transciever, source, sequence_number)
-        self.command = command
-        self.unaddressed = unaddressed
-
-    def __repr__(self):
-        if self.unaddressed:
-            return super().__repr__() + " unaddressed broadcast {}".format(self.command.name)
-        else:
-            return super().__repr__() + " broadcast {}".format(self.command.name)
-
-    @property
-    def affected_gear(self):
-        if self.command.has_side_effects:
-            return self.transciever.devices
-
 class BadFrame(DaliMessage):
     def __repr__(self):
         return super.__repr__() + " Bad Frame"
+
+
+
+

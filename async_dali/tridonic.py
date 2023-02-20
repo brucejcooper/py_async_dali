@@ -3,18 +3,18 @@ import asyncio
 import logging
 import threading
 from enum import Enum
+from typing import List
 
 import hid
 
-from .bus_transciever import (AddressedCommand, BadFrame, BroadcastCommand,
+from .bus_transciever import (AbstractDaliAddress, AddressedCommand, BadFrame,
                               DaliBusTransciever, DirectArcPowerCommand,
                               NakMessage, NumericResponseMessage,
                               SpecialCommand)
-from .types import (DaliCommandCode, DaliCommandType, DaliException,
-                    FramingException, MessageSource, SpecialCommandCode)
+from .types import (DaliCommandCode, FramingException, MessageSource,
+                    SpecialCommandCode, ItemDelta)
 
 _LOGGER = logging.getLogger(__name__)
-
 
 class MessageType(Enum):
     NAK = 0x71
@@ -27,12 +27,19 @@ class MessageType(Enum):
 class TridonicDali(DaliBusTransciever):
     VENDOR_ID=0x17b5
     PRODUCT_ID=0x0020
+    transceivers: List[DaliBusTransciever] = []
 
-    def __init__(self, hid, evt_loop=None) -> None:
+    def __init__(self, dev: hid.Device, evt_loop=None) -> None:
         DaliBusTransciever.__init__(self)
         self.next_sequence = 1
-        self.hid = hid
+        self.dev = dev
         self._opened = False
+        self.manufacturer = dev.manufacturer
+        self.model = dev.product
+        self.serial = dev.serial
+
+
+        # See if we can look up Manufacturer and Model information from pyudev
 
         self.outstanding_commands = dict()
 
@@ -43,17 +50,37 @@ class TridonicDali(DaliBusTransciever):
 
         # Add a default callback handler to deal with Responses
         self._new_message_callbacks.append(self._resolve_futures)
+        self._stop_listening = threading.Event()
+
+
+    @property
+    def unique_id(self):
+        return "tridonic-usb-{}".format(self.dev.serial)
+
 
     @classmethod
-    def scan_for_transcievers(cls):
-        res = []
-        for dev in hid.enumerate(TridonicDali.VENDOR_ID, TridonicDali.PRODUCT_ID):
-            res.append(TridonicDali(hid.Device(dev['vendor_id'], dev['product_id'], dev['serial_number'])))
+    async def _transciever_scan(cls) -> List[ItemDelta[DaliBusTransciever]]:  
+        """This can be called multiple times, and it will return any _new_"""
 
-        return res
+        added = []
+        removed = list(cls.transceivers)
+        _LOGGER.debug("Scanning for transmitters")
+        for h in hid.enumerate(TridonicDali.VENDOR_ID, TridonicDali.PRODUCT_ID):
+            serial = h['serial_number']
+
+            existing = [x for x in cls.transceivers if x.dev.serial == serial]
+            if len(existing) == 0:
+                hiddev = hid.Device(h['vendor_id'], h['product_id'], serial)
+
+                bus = TridonicDali(hiddev)
+                cls.transceivers.append(bus)
+                added.append(bus)
+            else:
+                removed.remove(existing[0])
+        return ItemDelta(added, removed)
 
     def __repr__(self):
-        return "<Tridonic Dali USB adapter serial={}>".format(self.hid.serial)
+        return self.unique_id
 
     async def __aenter__(self):
         self.open()
@@ -63,13 +90,11 @@ class TridonicDali(DaliBusTransciever):
         await self.close()
 
     def open(self):
-        self._stop_listening = threading.Event()
+        self._stop_listening.clear()
         self._read_thread = threading.Thread(target=self.read_loop, daemon=True)
         self._opened = True
         self._read_thread.start()
 
-    def read_message(self, msg):
-        print("READ", msg)
 
 
     def _resolve_futures(self, msg):
@@ -99,12 +124,12 @@ class TridonicDali(DaliBusTransciever):
             except:
                 _LOGGER.error("Got Exception", exc_info=1)
                 self.evt_loop.run_until_complete(self.close())
-        print("Reader finished")
+        _LOGGER.debug("Reader finished")
 
     async def close(self):
         """Stops listening and closes the HID device"""
         self._stop_listening.set()
-        self.hid.close()  # This will cause any active call to read to throw an exception.
+        self.dev.close()  # This will cause any active call to read to throw an exception.
         self._opened = False
 
     def get_seq(self):
@@ -171,7 +196,7 @@ class TridonicDali(DaliBusTransciever):
         data[7] = cmd & 0xFF
         _LOGGER.debug("Transmitting %s", bytes(data))
 
-        self.hid.write(bytes(data))
+        self.dev.write(bytes(data))
 
         # To make things easier on implementers, we automatically correlate Commands and responses via a future
         self.outstanding_commands[seq] = response
@@ -204,7 +229,8 @@ class TridonicDali(DaliBusTransciever):
         """
         if not self._opened:
             raise Exception("Device not open")
-        data = self.hid.read(16, timeout) # This will block until something is read, a timeout occurs, or the HID device is closed
+        data = self.dev.read(16) # This will block until something is read, a timeout occurs, or the HID device is closed
+        _LOGGER.debug("read %s(%d bytes)", data, len(data))
         if data is None or len(data) == 0:
             return None
 
@@ -222,19 +248,12 @@ class TridonicDali(DaliBusTransciever):
             elif message_type == MessageType.RESPONSE:
                 msg = NumericResponseMessage(self, direction, sequence_number, low_byte)
             else:
-                ct = DaliCommandType.from_addr(mid_byte)
-                if ct == DaliCommandType.SPECIAL_COMMAND:
+                if SpecialCommandCode.is_special_command(mid_byte):
                     msg = SpecialCommand(self, direction, sequence_number, SpecialCommandCode(mid_byte), low_byte)
-                elif ct == DaliCommandType.GEAR_ADDRESSED or ct == DaliCommandType.GROUP_ADDRESSED:
-                    msg = AddressedCommand(self, direction, sequence_number, mid_byte, DaliCommandCode(low_byte))
-                elif ct == DaliCommandType.BROADCAST:
-                    msg = BroadcastCommand(self, direction, sequence_number, False, DaliCommandCode(low_byte))
-                elif ct == DaliCommandType.UNADDRESSED_BROADCAST:
-                    msg = BroadcastCommand(self, direction, sequence_number, True, DaliCommandCode(low_byte))
-                elif ct == DaliCommandType.DIRECT_ARC_POWER_COMMAND:
-                    msg = DirectArcPowerCommand(self, direction, sequence_number, mid_byte, low_byte)
+                elif mid_byte & 0x01 == 0:
+                    msg = DirectArcPowerCommand(self, direction, sequence_number, AbstractDaliAddress.parse_address(mid_byte), low_byte)
                 else:
-                    raise DaliException("unknown message type")
+                    msg = AddressedCommand(self, direction, sequence_number, AbstractDaliAddress.parse_address(mid_byte), DaliCommandCode(low_byte))
         except:
             _LOGGER.warn("Could not process %s %s 0x%02x%02x%02x %d", direction, message_type, high_byte, mid_byte, low_byte, sequence_number, exc_info=1)
 

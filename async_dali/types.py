@@ -1,5 +1,6 @@
 """Types used by this module"""
 from enum import Enum
+from typing import Any, Generic, List, NamedTuple, TypeVar
 
 
 class DaliException(Exception):
@@ -109,34 +110,34 @@ class SpecialCommandCode(Enum):
     WriteMemoryLocation = 0xc7
     WriteMemoryLocationNoReply = 0xc9
 
+    @staticmethod
+    def is_special_command(addr_byte: int) -> bool:
+        return addr_byte & 0x80 == 0x80 and addr_byte & 0x60 != 0
 
-
-
-class DaliCommandType(Enum):
-    GEAR_ADDRESSED = 1
-    GROUP_ADDRESSED = 2
-    SPECIAL_COMMAND = 3
-    BROADCAST = 4
-    UNADDRESSED_BROADCAST = 5
-    DIRECT_ARC_POWER_COMMAND = 6
-
-    @classmethod
-    def from_addr(self, address: int):
-        if address == 0xFF:
-            return DaliCommandType.BROADCAST
-        elif address == 0xFD:
-            return DaliCommandType.UNADDRESSED_BROADCAST
-        elif address & 0x80:
-            if address & 0x60 == 0:
-                return DaliCommandType.GROUP_ADDRESSED
-            else:
-                return DaliCommandType.SPECIAL_COMMAND
-        elif address & 0x01 == 0:
-            return DaliCommandType.DIRECT_ARC_POWER_COMMAND
-        else:
-            return DaliCommandType.GEAR_ADDRESSED
 
 class MessageSource(Enum):
     EXTERNAL = 0x11
     SELF = 0x12
     SENT = 0x13  # I added this, but I can't remember why.
+
+
+
+
+T = TypeVar('T')
+
+class ItemDelta(Generic[T]):
+    """When scanning we want to know what was added and removed.  This presents a generic result of a scan"""
+    added: List[T]
+    removed: List[T]
+
+    def __init__(self, added: List[T], removed: List[T]) -> None:
+        self.added = added
+        self.removed = removed
+
+    def __repr__(self) -> str:
+        return "Delta(added: {}, removed: {})".format(self.added, self.removed)
+
+    def extend(self, d: 'ItemDelta'):
+        """Extends this delta with another delta - Note: this does not deal with duplicates"""
+        self.added.extend(d.added)
+        self.removed.extend(d.removed)
